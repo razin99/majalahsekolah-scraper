@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path"
+	"runtime"
 	"sync"
-	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
 const URL = "https://majalahsekolah.com/books/%s/files/large/%d.png"
@@ -27,9 +30,7 @@ func saveToDisk(bookId string, page int, blob io.Reader) error {
 	return nil
 }
 
-func downloader(bookId string, page int, onNotOkResponse func(), wg *sync.WaitGroup) {
-	defer wg.Done()
-
+func downloader(bookId string, page int, onNotOkResponse func()) {
 	url := fmt.Sprintf(URL, bookId, page)
 	res, err := http.Get(url)
 
@@ -57,20 +58,37 @@ func main() {
 		log.Fatal(err)
 	}
 
-	var wg sync.WaitGroup
+	maxWorkers := int64(runtime.NumCPU())
+	sem := semaphore.NewWeighted(maxWorkers)
+	ctx := context.Background()
+	var lock sync.Mutex
+	log.Println("Number of workers: ", maxWorkers)
 
 	foundLastPage := false
 	endLoop := func() {
 		foundLastPage = true
 	}
-	page := 1
+	page := 0
 	for !foundLastPage {
-		wg.Add(1)
-		go downloader(bookId, page, endLoop, &wg)
-		page += 1
-		// Prevent flooding the server with traffic
-		time.Sleep(time.Millisecond * 200)
+		if err := sem.Acquire(ctx, 1); err != nil {
+			log.Fatal(err)
+		}
+		go func() {
+			// make sure this is atomic
+			lock.Lock()
+			page += 1
+			lock.Unlock()
+
+			downloader(bookId, page, endLoop)
+			log.Printf("Downloaded  [book:%s][page:%d]\n", bookId, page)
+			sem.Release(1)
+		}()
 	}
-	wg.Wait()
-	fmt.Printf("Saved %d pages for book id: %s", page, bookId)
+	log.Printf("Found %d pages for book id: %s\n", page, bookId)
+
+	// Wait for all remaining workers to exit
+	sem.Acquire(ctx, maxWorkers)
+	sem.Release(maxWorkers)
+
+	log.Printf("Saved %d pages for book id: %s\n", page, bookId)
 }
